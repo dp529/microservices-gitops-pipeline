@@ -96,3 +96,20 @@ The inter-service addresses baked into env vars. These are what the Kustomize ba
 | checkoutservice | `CART_SERVICE_ADDR` | `cartservice:7070` |
 | recommendationservice | `PRODUCT_CATALOG_SERVICE_ADDR` | `productcatalogservice:3550` |
 | cartservice | `REDIS_ADDR` | `redis-cart:6379` |
+
+## Known deviations
+
+Things that are deliberately not production-grade in this lab, recorded so they
+are not mistaken for finished work.
+
+| Item | Current | Required before production | Where |
+|---|---|---|---|
+| redis-cart image | `redis:alpine` — a **mutable tag** | `redis@sha256:<digest>`. A mutable tag means two deploys of the same git commit can land different Redis versions, which breaks the "git is the source of truth" guarantee GitOps depends on. | `gitops/base/cartservice/redis-deployment.yaml` |
+| redis-cart storage | `emptyDir` | A PersistentVolumeClaim. Cart contents are lost on pod restart. | same file |
+| Application image tags | `<service>:<env>-placeholder` | Immutable digests written by CI (Phase 6) | `gitops/overlays/*/*/kustomization.yaml` |
+| Image registry | bare names, no registry host | ECR repository prefix via `newName` (Phase 7) | overlays |
+| frontend external access | ClusterIP only | Ingress or LoadBalancer (Phase 7) | `gitops/base/frontend/service.yaml` |
+
+The application images are placeholders by design and are resolved by CI. The
+redis tag is different: nothing downstream will replace it, so it stays mutable
+until someone changes it by hand.

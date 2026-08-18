@@ -21,6 +21,12 @@ spec:
         runAsUser: 1000
       containers:
         - name: redis
+          # MUTABLE TAG - not an immutable pin. Anyone can publish a new
+          # image under `redis:alpine`, so two deploys of this same commit
+          # can land different Redis versions. Acceptable for this lab.
+          # BEFORE PRODUCTION: replace with an explicit digest, e.g.
+          #   image: redis@sha256:<digest>
+          # See docs/deployable-units.md, "Known deviations".
           image: redis:alpine
           ports:
             - containerPort: 6379
