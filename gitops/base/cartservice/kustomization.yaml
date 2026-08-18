@@ -1,0 +1,12 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# NOTE: no commonLabels here. This base contains two distinct workloads
+# (cartservice and redis-cart) with different app labels; a blanket
+# commonLabels would overwrite redis-cart's selector and break it.
+
+resources:
+  - deployment.yaml
+  - service.yaml
+  - redis-deployment.yaml
+  - redis-service.yaml

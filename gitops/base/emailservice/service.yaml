@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: emailservice
+spec:
+  type: ClusterIP
+  selector:
+    app: emailservice
+  ports:
+    # NOTE: intentional port asymmetry. The container listens on 8080,
+    # but consumers address this service as emailservice:5000
+    # (checkoutservice EMAIL_SERVICE_ADDR). Do not "fix" this to match.
+    - name: grpc
+      port: 5000
+      targetPort: 8080
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: emailservice

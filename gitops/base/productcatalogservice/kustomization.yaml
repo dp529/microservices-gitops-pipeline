@@ -1,0 +1,10 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# The app label and selector are declared explicitly in deployment.yaml
+# and service.yaml. No commonLabels/labels directive is used: it is
+# redundant here, and a blanket selector mutation is exactly what breaks
+# multi-workload bases (see cartservice + redis-cart).
+resources:
+  - deployment.yaml
+  - service.yaml

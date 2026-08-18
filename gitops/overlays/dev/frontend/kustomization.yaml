@@ -1,0 +1,19 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: boutique-dev
+
+resources:
+  - ../../../base/frontend
+
+# CI replaces newTag with an immutable digest (Phase 6). The same digest
+# is promoted dev -> staging -> prod; only namespace, replicas and
+# resources differ between environments.
+images:
+  - name: frontend
+    newName: frontend
+    newTag: dev-placeholder
+
+replicas:
+  - name: frontend
+    count: 1
