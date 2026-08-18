@@ -1,0 +1,161 @@
+name: Promote
+
+# Copy an already-published image digest from one environment to the next.
+# No image is built here, and none is pushed: promotion moves a reference
+# that already exists.
+#
+#   dev -> staging   commits directly
+#   staging -> prod  opens a pull request against a protected environment
+#
+# Git is the promotion gate. Once the change is merged, Argo CD reconciles
+# it; there is no second manual sync step.
+
+on:
+  workflow_dispatch:
+    inputs:
+      source:
+        description: Environment to promote from
+        required: true
+        type: choice
+        options: [dev, staging]
+      target:
+        description: Environment to promote to
+        required: true
+        type: choice
+        options: [staging, prod]
+      services:
+        description: >-
+          Space-separated service names, or "all" for every service that
+          differs from the target.
+        required: true
+        default: all
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  promote:
+    name: ${{ inputs.source }} -> ${{ inputs.target }}
+    runs-on: ubuntu-latest
+    # For a prod promotion this binds the job to a GitHub environment, which
+    # is where required reviewers are configured. The job waits for that
+    # approval before it can even open the pull request.
+    environment: ${{ inputs.target == 'prod' && 'prod-promotion' || '' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install --quiet pyyaml
+
+      - name: Validate direction
+        run: |
+          # Rejects dev -> prod, staging -> dev, and same-environment
+          # promotion. The rule lives in ci/overlay.py so the workflow and
+          # the local tooling cannot disagree.
+          python - <<'PY'
+          import sys
+          sys.path.insert(0, "ci")
+          import overlay
+          src, tgt = "${{ inputs.source }}", "${{ inputs.target }}"
+          expected = overlay.PROMOTION_PATH.get(src)
+          if src == tgt or expected != tgt:
+              sys.exit("invalid promotion %s -> %s; %s promotes only to %s"
+                       % (src, tgt, src, expected or "nothing"))
+          print("%s -> %s is a valid promotion step" % (src, tgt))
+          PY
+
+      - name: Resolve service list
+        id: list
+        run: |
+          if [ "${{ inputs.services }}" = "all" ]; then
+            # Every service whose source digest differs from the target's.
+            # Selecting the whole release set at once is what keeps a
+            # ten-service proto release from being promoted piecemeal.
+            services=$(python - <<'PY'
+          import sys
+          sys.path.insert(0, "ci")
+          import overlay
+          from pathlib import Path
+          src, tgt = "${{ inputs.source }}", "${{ inputs.target }}"
+          out = []
+          root = overlay.REPO / "gitops" / "overlays" / src
+          for d in sorted(p.name for p in root.iterdir() if p.is_dir()):
+              _, sd, _ = overlay.read_image(src, d)
+              _, td, _ = overlay.read_image(tgt, d)
+              if sd and sd != td:
+                  out.append(d)
+          print(" ".join(out))
+          PY
+          )
+          else
+            services="${{ inputs.services }}"
+          fi
+          echo "services=$services" >> "$GITHUB_OUTPUT"
+          echo "count=$(echo $services | wc -w)" >> "$GITHUB_OUTPUT"
+          echo "promoting: ${services:-<none>}"
+
+      - name: Nothing to do
+        if: steps.list.outputs.count == '0'
+        run: echo "${{ inputs.target }} already matches ${{ inputs.source }}."
+
+      - name: Promote digests
+        if: steps.list.outputs.count != '0'
+        run: |
+          python ci/overlay.py promote \
+            "${{ inputs.source }}" "${{ inputs.target }}" \
+            ${{ steps.list.outputs.services }}
+
+      - name: Verify
+        if: steps.list.outputs.count != '0'
+        run: |
+          python ci/verify_release.py \
+            --expect-env "${{ inputs.target }}" \
+            --expect-services ${{ steps.list.outputs.services }}
+          # Prove the digest was copied, not regenerated.
+          python ci/test_promotion.py --compare \
+            "${{ inputs.source }}" "${{ inputs.target }}" \
+            ${{ steps.list.outputs.services }}
+
+      # staging: commit straight to main. The digest already ran in dev.
+      - name: Commit to main
+        if: steps.list.outputs.count != '0' && inputs.target == 'staging'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add gitops/overlays/staging
+          git commit -m "staging: promote ${{ steps.list.outputs.count }} service(s) from dev"
+          git push
+
+      # prod: open a pull request so the merge is the approval boundary.
+      - name: Open promotion pull request
+        if: steps.list.outputs.count != '0' && inputs.target == 'prod'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          branch="promote/prod-${{ github.run_id }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
+          git add gitops/overlays/prod
+          git commit -m "prod: promote ${{ steps.list.outputs.count }} service(s) from staging"
+          git push origin "$branch"
+          gh pr create \
+            --title "Promote to prod: ${{ steps.list.outputs.count }} service(s)" \
+            --body "$(cat <<'EOF'
+          Promotes already-published image digests from staging to prod.
+
+          No image is built or pushed by this change. Each digest below is
+          copied verbatim from the staging overlay, so prod runs the exact
+          artifact staging ran.
+
+          Merging this pull request is the production approval. Argo CD
+          reconciles automatically afterwards; there is no separate manual
+          sync.
+          EOF
+          )" \
+            --base main --head "$branch"

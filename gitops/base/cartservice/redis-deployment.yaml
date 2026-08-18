@@ -21,13 +21,16 @@ spec:
         runAsUser: 1000
       containers:
         - name: redis
-          # MUTABLE TAG - not an immutable pin. Anyone can publish a new
-          # image under `redis:alpine`, so two deploys of this same commit
-          # can land different Redis versions. Acceptable for this lab.
-          # BEFORE PRODUCTION: replace with an explicit digest, e.g.
-          #   image: redis@sha256:<digest>
-          # See docs/deployable-units.md, "Known deviations".
-          image: redis:alpine
+          # Pinned to an immutable digest, resolved from the public registry
+          # for redis:7.4-alpine. A bare tag such as `redis:alpine` is
+          # mutable: the same git commit could deploy a different Redis
+          # version on a later reconcile, which breaks the guarantee that
+          # git describes what is running.
+          #
+          # This is not promoted by CI - redis is a backing dependency of
+          # cartservice, not one of the ten application services - so it is
+          # updated deliberately by editing this line.
+          image: redis@sha256:e7723ff73d963f5cc6d9c4643ea3d989527a402a319239054e9472a7fb9219a2
           ports:
             - containerPort: 6379
           readinessProbe:

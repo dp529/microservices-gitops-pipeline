@@ -1,77 +1,103 @@
-# Affected-service detection
+# CI: detection, build, publish, promotion
 
-Given a range of commits, decide which of the ten services CI would need to
-rebuild. Phase 5 stops at the decision: nothing is built or pushed.
+The delivery pipeline. Source changes select services, selected services are
+built and pushed, the resulting digests are pinned into dev, and promotion
+copies those digests onward without rebuilding.
 
-    python ci/affected.py --base origin/main --head HEAD
-    python ci/affected.py --files src/paymentservice/charge.js --json
+```
+change -> detect -> build only affected -> push to ECR -> read digest
+                                                              |
+                                                     pin into dev overlay
+                                                              |
+                                            promote (copy) -> staging
+                                                              |
+                                     promote via PR (copy) -> prod
+```
 
-Exit 0 when a decision was made (an empty matrix is a valid decision).
-Exit 2 when a path under `src/` belongs to no configured service.
+## Files
 
-## Source of truth
-
-`ci/services.yaml` holds one entry per service with three separate fields:
-
-| Field | Meaning |
+| File | Purpose |
 |---|---|
-| `watch` | a change anywhere beneath this path means the service changed |
-| `context` | the directory passed to `docker build` |
-| `dockerfile` | the Dockerfile to build with |
+| `services.yaml` | source of truth: name, watch path, build context, dockerfile |
+| `affected.py` | changed paths -> the services CI must build, as a JSON matrix |
+| `build_all.py` | build every service locally from its real context |
+| `publish.py` | write published digests into the dev overlays |
+| `overlay.py` | read/write an overlay's image reference; promotion rules |
+| `verify_release.py` | assert a release change is confined and digest-pinned |
+| `ecr_repositories.sh` | one-time ECR repository creation (run by a human) |
+| `test_affected.py` | 23 detector tests |
+| `test_promotion.py` | 29 pinning and promotion tests |
+| `test_pipeline.py` | 25 end-to-end simulation checks |
 
-For nine services `watch` and `context` are the same path. They are separate
-fields because of cartservice, where they genuinely differ: the solution file
-and tests live at `src/cartservice`, but the Dockerfile and `.csproj` live at
-`src/cartservice/src`. Watching only the build context would miss a change to
-the tests; building from the watch path would not find the Dockerfile.
+## Immutability
 
-Two additional lists:
+The deployment source of truth is a digest, never a tag:
 
-- `fanout` - paths that affect every service. Only `protos` qualifies: all ten
-  services compile against `protos/demo.proto` and commit their generated
-  stubs. Without this, a proto-only change matches no service directory and
-  builds nothing.
-- `ignore` - paths that never trigger an application build, including
-  `gitops/`. Rebuilding an image because an overlay changed would invert the
-  promotion model, where CI produces an image and Git promotes it.
+```yaml
+images:
+  - name: paymentservice
+    newName: <account>.dkr.ecr.<region>.amazonaws.com/boutique/paymentservice
+    digest: sha256:3f0a91c5...
+    # tag sha-9e7aaac is for human traceability only
+```
 
-## Decision order
+The digest is read back from the registry after the push, so it is what the
+registry actually stored. A commit SHA tag is recorded as a comment for
+traceability, but nothing deploys from it. `overlay.py` refuses to write
+anything that is not `sha256:` followed by 64 hex characters, so a mutable
+tag cannot become the deployment reference by accident.
 
-For each changed path, first match wins:
+## Promotion
 
-1. under a `fanout` path -> every service is affected
-2. under an `ignore` path -> nothing is affected
-3. under a service's `watch` path -> that service is affected
-4. otherwise under `src/` -> unknown deployable unit, reported, exit 2
-5. otherwise -> not an application file, no build
+Promotion copies an existing digest to the next environment. It never builds.
 
-Matching is segment-wise, so `src/cart` does not match `src/cartservice`.
+    python ci/overlay.py promote dev staging paymentservice
+    python ci/overlay.py promote staging prod paymentservice
 
-Deletions and renames count as changes: the diff is taken with
-`--no-renames`, so a file moved between two services selects both.
+Rejected, with the reason stated:
 
-## Output
+| Attempt | Why it fails |
+|---|---|
+| `dev -> prod` | skips staging; prod would run something staging never ran |
+| `staging -> dev` | backwards |
+| `dev -> dev` | same environment |
+| `prod -> anything` | end of the line |
+| promoting a service dev never published | there is no digest to copy |
 
-    {
-      "services": [
-        {
-          "name": "paymentservice",
-          "context": "src/paymentservice",
-          "dockerfile": "src/paymentservice/Dockerfile"
-        }
-      ]
-    }
+A multi-service release - a `protos/` change fans out to all ten - is
+promoted as a set, so no service is silently left behind on an older digest.
 
-The `{"services": [...]}` shape is consumed directly by a GitHub Actions
-matrix, where each entry is available as `matrix.services.name`,
-`matrix.services.context` and `matrix.services.dockerfile`.
+## Environment boundaries
 
-## Tests
+- **dev** is written only by CI, on a push to `main`. A pull request builds
+  the image to prove it compiles but publishes nothing.
+- **staging** is written only by promotion, committed straight to `main`.
+- **prod** is written only by promotion, and only through a pull request
+  raised by a job bound to the `prod-promotion` GitHub environment. Merging
+  that pull request is the production approval.
 
-    python ci/test_affected.py
+Git is the gate. Once a change is merged, Argo CD reconciles it; there is no
+second manual sync step.
 
-23 checks. Cases covering deletions, renames, cross-service moves and
-multi-commit ranges run against a real throwaway git repository rather than a
-simulation of `git diff`. Two further checks assert that every path in
-`services.yaml` exists on disk and that no directory under `src/` is left
-unconfigured, so the config cannot drift from the source tree unnoticed.
+## AWS
+
+Authentication is GitHub OIDC to an IAM role. No static access keys exist in
+this repository, and `test_promotion.py` fails the build if an access key or
+a 12-digit ECR host is ever committed.
+
+Three repository variables are required, and are not committed:
+
+| Variable | Example |
+|---|---|
+| `AWS_REGION` | `eu-west-1` |
+| `AWS_ACCOUNT_ID` | the 12-digit account id |
+| `AWS_ROLE_ARN` | `arn:aws:iam::<account>:role/<role>` |
+
+When they are absent the workflow still builds every affected image, and
+skips only the push and the digest pinning. Nothing pretends to have
+succeeded.
+
+One ECR repository per service under a `boutique/` prefix, created by
+`ecr_repositories.sh`. Separate repositories give per-service lifecycle
+policies, scan findings and IAM scoping; a single shared repository with the
+service in the tag gives up all three.

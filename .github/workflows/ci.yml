@@ -1,15 +1,28 @@
 name: CI
 
-# Phase 5 scope: work out which services a change would require rebuilding.
-# Nothing is built or pushed yet. The build job is deliberately a report.
+# Detect which services changed, build only those, push them to ECR, and
+# pin the resulting digests into the dev overlays.
+#
+# Promotion to staging and prod is a separate workflow: this one never
+# writes to those environments.
 
 on:
   pull_request:
   push:
     branches: [main]
 
+# Required for GitHub's OIDC provider to mint a token for AWS. No static
+# AWS keys exist in this repository.
 permissions:
-  contents: read
+  contents: write
+  id-token: write
+
+env:
+  # Supplied as repository variables, not committed. Absent on a fork or a
+  # repository that has not been configured, which the guard job detects.
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+  AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
 
 jobs:
   detect:
@@ -18,12 +31,13 @@ jobs:
     outputs:
       matrix: ${{ steps.detect.outputs.matrix }}
       any: ${{ steps.detect.outputs.any }}
+      tag: ${{ steps.meta.outputs.tag }}
+      push: ${{ steps.meta.outputs.push }}
     steps:
       - uses: actions/checkout@v4
         with:
           # The detector diffs two refs, so the history connecting them has
-          # to be present. A shallow clone would make the merge base
-          # unreachable and the diff meaningless.
+          # to be present. A shallow clone makes the merge base unreachable.
           fetch-depth: 0
 
       - uses: actions/setup-python@v5
@@ -32,50 +46,171 @@ jobs:
 
       - run: pip install --quiet pyyaml
 
-      - name: Determine diff range
-        id: range
+      - name: Determine diff range and image tag
+        id: meta
         run: |
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             echo "base=${{ github.event.pull_request.base.sha }}" >> "$GITHUB_OUTPUT"
             echo "head=${{ github.event.pull_request.head.sha }}" >> "$GITHUB_OUTPUT"
+            # A pull request builds to prove the image builds, but publishes
+            # nothing: an unmerged change must not reach a dev overlay.
+            echo "push=false" >> "$GITHUB_OUTPUT"
           else
-            # On a push, github.event.before is the previous tip of the
-            # branch. It is all zeroes for the first push to a new branch,
-            # in which case fall back to the parent commit.
             before="${{ github.event.before }}"
             if [ -z "$before" ] || [ "$before" = "0000000000000000000000000000000000000000" ]; then
               before="${{ github.sha }}^"
             fi
             echo "base=$before" >> "$GITHUB_OUTPUT"
             echo "head=${{ github.sha }}" >> "$GITHUB_OUTPUT"
+            echo "push=true" >> "$GITHUB_OUTPUT"
           fi
+          echo "tag=sha-$(echo ${{ github.sha }} | cut -c1-7)" >> "$GITHUB_OUTPUT"
 
       - name: Detect
         id: detect
         run: |
           python ci/affected.py \
-            --base "${{ steps.range.outputs.base }}" \
-            --head "${{ steps.range.outputs.head }}" \
+            --base "${{ steps.meta.outputs.base }}" \
+            --head "${{ steps.meta.outputs.head }}" \
             --github-output "$GITHUB_OUTPUT"
 
-  report:
-    name: ${{ matrix.services.name }}
+  build:
+    name: build ${{ matrix.services.name }}
     needs: detect
     if: needs.detect.outputs.any == 'true'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.detect.outputs.matrix) }}
+    outputs:
+      # Note: with a matrix, outputs are overwritten by each job. The digests
+      # are passed to the publish job as artifacts instead, one file per
+      # service, so nothing is lost when several services build at once.
+      dummy: ""
     steps:
-      # Phase 5 stops here. This is where `docker build` will go, using
-      # exactly the context and dockerfile the detector resolved - which is
-      # why cartservice carries src/cartservice/src rather than its watch
-      # path.
-      - name: Report what would be built
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Check AWS configuration
+        id: aws
         run: |
-          echo "would build: ${{ matrix.services.name }}"
-          echo "  context:    ${{ matrix.services.context }}"
-          echo "  dockerfile: ${{ matrix.services.dockerfile }}"
+          if [ -n "$AWS_ROLE_ARN" ] && [ -n "$AWS_ACCOUNT_ID" ] && [ -n "$AWS_REGION" ]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::AWS_ROLE_ARN, AWS_ACCOUNT_ID or AWS_REGION is not set. Building locally without pushing."
+          fi
+
+      # OIDC: GitHub mints a short-lived token, AWS trades it for temporary
+      # credentials via the configured IAM role. No long-lived secret exists.
+      - name: Configure AWS credentials
+        if: steps.aws.outputs.configured == 'true'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: boutique-ci-${{ github.run_id }}
+
+      - name: Log in to ECR
+        if: steps.aws.outputs.configured == 'true'
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          # The detector resolved these. cartservice's context is
+          # src/cartservice/src while its watch path is src/cartservice,
+          # which is why the two are separate fields in ci/services.yaml.
+          context: ${{ matrix.services.context }}
+          file: ${{ matrix.services.dockerfile }}
+          push: ${{ needs.detect.outputs.push == 'true' && steps.aws.outputs.configured == 'true' }}
+          tags: ${{ steps.aws.outputs.configured == 'true' && format('{0}/boutique/{1}:{2}', steps.ecr.outputs.registry, matrix.services.name, needs.detect.outputs.tag) || format('boutique/{0}:{1}', matrix.services.name, needs.detect.outputs.tag) }}
+          provenance: false
+          cache-from: type=gha,scope=${{ matrix.services.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.services.name }}
+
+      - name: Record digest
+        if: needs.detect.outputs.push == 'true' && steps.aws.outputs.configured == 'true'
+        run: |
+          # The digest comes from the registry, not from anything computed
+          # locally. This is the value GitOps deploys.
+          mkdir -p digests
+          echo "${{ matrix.services.name }}=${{ steps.build.outputs.digest }}" \
+            > "digests/${{ matrix.services.name }}.txt"
+
+      - name: Upload digest
+        if: needs.detect.outputs.push == 'true' && steps.aws.outputs.configured == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.services.name }}
+          path: digests/
+          retention-days: 1
+
+  publish:
+    name: Pin digests into dev
+    needs: [detect, build]
+    if: needs.detect.outputs.any == 'true' && needs.detect.outputs.push == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install --quiet pyyaml
+
+      - name: Check AWS configuration
+        id: aws
+        run: |
+          if [ -n "$AWS_ROLE_ARN" ] && [ -n "$AWS_ACCOUNT_ID" ] && [ -n "$AWS_REGION" ]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::AWS not configured; no images were pushed, so there are no digests to pin."
+          fi
+
+      - name: Download digests
+        if: steps.aws.outputs.configured == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          pattern: digest-*
+          merge-multiple: true
+          path: digests
+
+      - name: Pin every built service
+        if: steps.aws.outputs.configured == 'true'
+        run: |
+          # One argument per service that was actually built, so a
+          # multi-service release - a protos change fans out to all ten -
+          # updates every one of them and drops none.
+          pairs=$(cat digests/*.txt | tr '\n' ' ')
+          echo "pinning: $pairs"
+          python ci/publish.py \
+            --registry "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com" \
+            --tag "${{ needs.detect.outputs.tag }}" \
+            $pairs
+
+      - name: Verify only affected overlays changed
+        if: steps.aws.outputs.configured == 'true'
+        run: python ci/verify_release.py --expect-env dev
+
+      - name: Commit
+        if: steps.aws.outputs.configured == 'true'
+        run: |
+          if git diff --quiet; then
+            echo "no overlay changes"; exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add gitops/overlays/dev
+          git commit -m "dev: pin $(ls digests | wc -l) service digest(s) from ${{ needs.detect.outputs.tag }}"
+          git push
 
   none:
     name: No services affected
