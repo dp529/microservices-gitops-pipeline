@@ -88,8 +88,7 @@ spec:
           # in this file.
           # ---------------------------------------------------------------
           - git:
-              # PLACEHOLDER - replace with the real repository URL.
-              repoURL: https://github.com/REPLACE-ME/boutique-gitops.git
+              repoURL: https://github.com/dp529/microservices-gitops-pipeline.git
               revision: main
               directories:
                 - path: gitops/overlays/{{.environment}}/*
@@ -117,8 +116,8 @@ spec:
       project: boutique
 
       source:
-        # PLACEHOLDER - must match sourceRepos in project.yaml.
-        repoURL: https://github.com/REPLACE-ME/boutique-gitops.git
+        # Must match sourceRepos in project.yaml.
+        repoURL: https://github.com/dp529/microservices-gitops-pipeline.git
         targetRevision: "{{.revision}}"
         # Under Go templating the git generator's `path` is an object;
         # `.path.path` is the directory relative to the repository root.

@@ -14,10 +14,9 @@ spec:
 
   # ---------------------------------------------------------------------
   # Source: only this repository may feed these Applications.
-  # PLACEHOLDER - replace with the real repository URL (see docs).
   # ---------------------------------------------------------------------
   sourceRepos:
-    - https://github.com/REPLACE-ME/boutique-gitops.git
+    - https://github.com/dp529/microservices-gitops-pipeline.git
 
   # ---------------------------------------------------------------------
   # Destinations: one entry per environment.
