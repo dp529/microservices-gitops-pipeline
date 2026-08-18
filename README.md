@@ -44,18 +44,38 @@ One base per service, three thin environment overlays pointing at it. The same i
 
 Each overlay stays tiny — a reference to the base, a namespace, an image digest, a replica count.
 
+## Status
+
+The GitOps layer, the affected-service detector, the promotion tooling and all
+ten container builds are implemented and tested locally: 10/10 images build
+from the real upstream Dockerfiles, 30/30 overlays render, and 132 checks pass
+across five suites.
+
+The two GitHub Actions workflows have **not yet been executed against real
+infrastructure.** Their YAML is validated and the Python they call is covered
+by tests, but the parts that only exist inside a runner - the OIDC handshake
+with AWS, the ECR push, reading the digest back from the registry, passing
+digests between matrix jobs as artifacts, and the pull-request-based
+production gate - have not run end to end. No AWS account is wired up, so
+every digest exercised in the tests is synthetic and the overlays still carry
+their placeholder tags.
+
+What that means in practice: the delivery logic is proven, the CI wiring is
+not. See [ci/README.md](ci/README.md) for the AWS setup required to close
+that gap.
+
 ## Phases
 
 | Phase | Scope | Status |
 |---|---|---|
 | 1 | Discovery of the real source | Done |
 | 2A | Repository layout | Done |
-| 2B | 10 Kustomize bases + dev/staging/prod overlays | Not started |
-| 3 | Render and validate the 30 overlays | Not started |
-| 4 | Argo CD ApplicationSet + AppProject | Not started |
-| 5 | CI changed-service detection and builds | Not started |
-| 6 | Digest promotion dev → staging → prod | Not started |
-| 7 | ECR / EKS integration | Not started |
+| 2B | 10 Kustomize bases + dev/staging/prod overlays | Done |
+| 3 | Render and validate the 30 overlays | Done |
+| 4 | Argo CD ApplicationSet + AppProject | Done |
+| 5 | CI changed-service detection and builds | Done |
+| 6 | Digest promotion dev → staging → prod | Done |
+| 7 | ECR / EKS integration | Workflows written, not yet run against AWS |
 
 ## Source provenance
 

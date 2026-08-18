@@ -82,11 +82,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.detect.outputs.matrix) }}
-    outputs:
-      # Note: with a matrix, outputs are overwritten by each job. The digests
-      # are passed to the publish job as artifacts instead, one file per
-      # service, so nothing is lost when several services build at once.
-      dummy: ""
+    # No job outputs: with a matrix, a job output is overwritten by whichever
+    # job finishes last. Digests are passed to the publish job as artifacts
+    # instead, one file per service, so a ten-service release loses none.
     steps:
       - uses: actions/checkout@v4
 
