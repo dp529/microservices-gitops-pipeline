@@ -1,0 +1,76 @@
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: boutique
+  namespace: argocd
+  finalizers:
+    # Block deletion of the project while Applications still belong to it.
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  description: >-
+    Online Boutique. Ten application services across dev, staging and prod.
+    Promotion is gated in Git; Argo CD reconciles whatever digest the
+    environment overlay declares.
+
+  # ---------------------------------------------------------------------
+  # Source: only this repository may feed these Applications.
+  # PLACEHOLDER - replace with the real repository URL (see docs).
+  # ---------------------------------------------------------------------
+  sourceRepos:
+    - https://github.com/REPLACE-ME/boutique-gitops.git
+
+  # ---------------------------------------------------------------------
+  # Destinations: one entry per environment.
+  #
+  # `server` is the in-cluster address for now because no external clusters
+  # are registered yet. When real EKS clusters are added, each environment
+  # points at its own cluster and these three entries diverge.
+  #
+  # Namespaces are listed explicitly rather than with a wildcard, so an
+  # overlay cannot silently deploy somewhere it was not meant to.
+  # ---------------------------------------------------------------------
+  destinations:
+    - name: dev
+      server: https://kubernetes.default.svc
+      namespace: boutique-dev
+    - name: staging
+      server: https://kubernetes.default.svc
+      namespace: boutique-staging
+    - name: prod
+      server: https://kubernetes.default.svc
+      namespace: boutique-prod
+
+  # ---------------------------------------------------------------------
+  # Allowed resource kinds.
+  #
+  # The overlays render exactly three namespaced kinds. Anything else is a
+  # mistake or an injection, so the allow-list is written to match rather
+  # than left open with '*'.
+  # ---------------------------------------------------------------------
+  namespaceResourceWhitelist:
+    - group: apps
+      kind: Deployment
+    - group: ""
+      kind: Service
+    - group: ""
+      kind: ServiceAccount
+
+  # No Application in this project may create cluster-scoped resources.
+  # Namespaces themselves are created by CreateNamespace=true, which is a
+  # sync option and does not require a cluster-scoped permission here.
+  clusterResourceWhitelist: []
+
+  # ---------------------------------------------------------------------
+  # Orphaned resources: warn, do not delete.
+  #
+  # If something exists in a boutique namespace that no Application owns,
+  # surface it in the UI rather than pruning it. Pruning is handled per
+  # Application by the sync policy.
+  # ---------------------------------------------------------------------
+  orphanedResources:
+    warn: true
+
+  # ---------------------------------------------------------------------
+  # Roles are intentionally omitted. Access control belongs with the real
+  # cluster and SSO configuration, which do not exist yet.
+  # ---------------------------------------------------------------------

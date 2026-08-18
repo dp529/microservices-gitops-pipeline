@@ -52,3 +52,39 @@ the two that matter most for this repository:
   actually breaks checkout
 
 The scratch copy was deleted afterwards; the mutations never touched this tree.
+
+# ApplicationSet validation
+
+`appset_check.py` validates the Argo CD configuration without a cluster. Argo
+CD is not installed and nothing is registered, so instead of a schema check it
+*simulates the matrix generator* against the real repository layout and checks
+the Applications it would produce.
+
+    python gitops/validate/appset_check.py
+
+## What it checks
+
+| Check | Failure it catches |
+|---|---|
+| Exactly one matrix generator, pairing a list with a git generator | The topology silently changed shape |
+| Git generator path is parameterised by `{{environment}}` | Generator hardcoded to one environment |
+| No service name appears literally in the ApplicationSet | Services listed by hand instead of discovered |
+| Expansion yields environments x services Applications | A service exists in some environments but not others |
+| Every environment discovers the same service set | Partial rollout of a new service |
+| Application names are `<service>-<environment>` and unique | Name collisions across environments |
+| No unresolved `{{...}}` remain after substitution | A template variable the generator never supplies |
+| Each source path exists and holds a `kustomization.yaml` | Application points at nothing |
+| Application namespace matches what the overlay renders | Deploying into an unintended namespace |
+| repoURL is in the AppProject `sourceRepos` | Application blocked at sync time |
+| Destination is in the AppProject `destinations` | Application blocked at sync time |
+| Every Application is automated and self-heals | A manual sync gate reintroduced on top of the Git gate |
+| Prod does not prune; non-prod does | Prod tears down workloads on an accidental Git deletion |
+| AppProject permits no cluster-scoped resources | Overly broad permissions |
+
+## Mutation testing
+
+Nine defects were injected into a repository-shaped scratch copy; all nine were
+caught. Two bugs in the validator itself were found and fixed this way: source
+paths were resolved against the wrong root, and the sample-report code crashed
+on a missing `automated` block before the findings could print. Both would have
+made the tool report success on broken input.

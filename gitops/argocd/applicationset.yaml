@@ -1,0 +1,164 @@
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: boutique
+  namespace: argocd
+spec:
+  # Keep generated Applications when this ApplicationSet is deleted, rather
+  # than cascading a delete across every environment at once.
+  syncPolicy:
+    preserveResourcesOnDeletion: true
+
+  # =====================================================================
+  # MATRIX: environments (explicit) x services (discovered)
+  #
+  # The two generators are deliberately different in kind:
+  #
+  #   - Environments are a LIST. There are exactly three, they carry
+  #     per-environment settings, and a fourth should never appear by
+  #     accident because someone added a directory.
+  #
+  #   - Services are DISCOVERED from the repository by a git directory
+  #     generator. Service names are never written down here. Adding
+  #     gitops/overlays/*/newservice/ creates its Applications; deleting
+  #     the directories removes them.
+  #
+  # The matrix takes the cross product: 3 environments x 10 discovered
+  # services = 30 Applications.
+  # =====================================================================
+  generators:
+    - matrix:
+        generators:
+          # ---------------------------------------------------------------
+          # Generator 1 - environments, explicit.
+          #
+          # Every environment-specific value lives here. Today the three
+          # entries differ only in namespace and revision; the fields are
+          # already separated so that when real clusters exist, only this
+          # block changes.
+          # ---------------------------------------------------------------
+          - list:
+              elements:
+                - environment: dev
+                  namespace: boutique-dev
+                  # PLACEHOLDER - no external clusters registered yet.
+                  # Becomes the dev EKS cluster's API server URL.
+                  destinationServer: https://kubernetes.default.svc
+                  # Dev tracks the mainline. A merge to main reaches dev
+                  # without a promotion PR.
+                  revision: main
+                  selfHeal: "true"
+                  prune: "true"
+
+                - environment: staging
+                  namespace: boutique-staging
+                  destinationServer: https://kubernetes.default.svc
+                  revision: main
+                  selfHeal: "true"
+                  prune: "true"
+
+                - environment: prod
+                  namespace: boutique-prod
+                  destinationServer: https://kubernetes.default.svc
+                  revision: main
+                  selfHeal: "true"
+                  # Prod does not prune. A resource disappearing from the
+                  # rendered output is reported as OutOfSync rather than
+                  # deleted, so an accidental removal in Git does not
+                  # silently tear down a running workload.
+                  prune: "false"
+
+          # ---------------------------------------------------------------
+          # Generator 2 - services, discovered from the repository.
+          #
+          # `{{environment}}` is substituted from the list generator above,
+          # so this scans the directories that actually exist inside the
+          # environment being generated. No service name appears anywhere
+          # in this file.
+          # ---------------------------------------------------------------
+          - git:
+              # PLACEHOLDER - replace with the real repository URL.
+              repoURL: https://github.com/REPLACE-ME/boutique-gitops.git
+              revision: main
+              directories:
+                - path: gitops/overlays/{{environment}}/*
+              # `path.basename` from this generator is the service name.
+
+  # =====================================================================
+  # TEMPLATE - one Application per (environment, service) pair.
+  # =====================================================================
+  template:
+    metadata:
+      # <service>-<environment>, where <service> is the discovered
+      # directory name. No service is named anywhere in this file.
+      name: "{{path.basename}}-{{environment}}"
+      labels:
+        app.kubernetes.io/name: "{{path.basename}}"
+        app.kubernetes.io/part-of: boutique
+        boutique.env: "{{environment}}"
+      finalizers:
+        - resources-finalizer.argocd.argoproj.io
+    spec:
+      project: boutique
+
+      source:
+        # PLACEHOLDER - must match sourceRepos in project.yaml.
+        repoURL: https://github.com/REPLACE-ME/boutique-gitops.git
+        targetRevision: "{{revision}}"
+        # `path` is the discovered directory itself, so this resolves to
+        # gitops/overlays/<environment>/<service> without reassembling it
+        # from parts.
+        path: "{{path}}"
+
+      destination:
+        server: "{{destinationServer}}"
+        # The overlay already sets this namespace. Declaring it here too
+        # means a mismatch between the two is caught by the AppProject
+        # destination allow-list instead of deploying somewhere unintended.
+        namespace: "{{namespace}}"
+
+      # -----------------------------------------------------------------
+      # Sync policy.
+      #
+      # All three environments automate. The promotion gate is the Git
+      # change itself: a digest reaches staging or prod only through a
+      # promotion PR. Requiring a manual Argo sync on top of an approved,
+      # merged PR would be a second approval for a decision already made,
+      # and would leave the cluster knowingly diverged from Git in the
+      # meantime.
+      #
+      # Prod differs from dev in what it will do on its own - it self-heals
+      # but never prunes - not in whether a human pressed a button.
+      # -----------------------------------------------------------------
+      syncPolicy:
+        automated:
+          prune: "{{prune}}"
+          selfHeal: "{{selfHeal}}"
+          # Do not sync while the target revision is missing or the repo is
+          # unreachable; leave the last good state running.
+          allowEmpty: false
+        syncOptions:
+          - CreateNamespace=true
+          # Argo CD applies the namespace from destination.namespace rather
+          # than trusting whatever the manifest carries.
+          - RespectIgnoreDifferences=true
+          - ApplyOutOfSyncOnly=true
+        retry:
+          limit: 5
+          backoff:
+            duration: 10s
+            factor: 2
+            maxDuration: 3m
+
+      # -----------------------------------------------------------------
+      # Ignore replica drift caused by an autoscaler.
+      #
+      # Nothing autoscales these workloads yet. The rule is present because
+      # the moment an HPA is added, Argo CD and the HPA would otherwise
+      # fight over spec.replicas indefinitely.
+      # -----------------------------------------------------------------
+      ignoreDifferences:
+        - group: apps
+          kind: Deployment
+          jsonPointers:
+            - /spec/replicas
