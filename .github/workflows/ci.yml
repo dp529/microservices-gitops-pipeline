@@ -1,0 +1,86 @@
+name: CI
+
+# Phase 5 scope: work out which services a change would require rebuilding.
+# Nothing is built or pushed yet. The build job is deliberately a report.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  detect:
+    name: Detect affected services
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.detect.outputs.matrix }}
+      any: ${{ steps.detect.outputs.any }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The detector diffs two refs, so the history connecting them has
+          # to be present. A shallow clone would make the merge base
+          # unreachable and the diff meaningless.
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install --quiet pyyaml
+
+      - name: Determine diff range
+        id: range
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "base=${{ github.event.pull_request.base.sha }}" >> "$GITHUB_OUTPUT"
+            echo "head=${{ github.event.pull_request.head.sha }}" >> "$GITHUB_OUTPUT"
+          else
+            # On a push, github.event.before is the previous tip of the
+            # branch. It is all zeroes for the first push to a new branch,
+            # in which case fall back to the parent commit.
+            before="${{ github.event.before }}"
+            if [ -z "$before" ] || [ "$before" = "0000000000000000000000000000000000000000" ]; then
+              before="${{ github.sha }}^"
+            fi
+            echo "base=$before" >> "$GITHUB_OUTPUT"
+            echo "head=${{ github.sha }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Detect
+        id: detect
+        run: |
+          python ci/affected.py \
+            --base "${{ steps.range.outputs.base }}" \
+            --head "${{ steps.range.outputs.head }}" \
+            --github-output "$GITHUB_OUTPUT"
+
+  report:
+    name: ${{ matrix.services.name }}
+    needs: detect
+    if: needs.detect.outputs.any == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.detect.outputs.matrix) }}
+    steps:
+      # Phase 5 stops here. This is where `docker build` will go, using
+      # exactly the context and dockerfile the detector resolved - which is
+      # why cartservice carries src/cartservice/src rather than its watch
+      # path.
+      - name: Report what would be built
+        run: |
+          echo "would build: ${{ matrix.services.name }}"
+          echo "  context:    ${{ matrix.services.context }}"
+          echo "  dockerfile: ${{ matrix.services.dockerfile }}"
+
+  none:
+    name: No services affected
+    needs: detect
+    if: needs.detect.outputs.any != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "No application services affected by this change."

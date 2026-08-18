@@ -1,0 +1,99 @@
+# Source of truth for the deployable units.
+#
+# One entry per service. Three fields, because Phase 1 discovery found that
+# for cartservice they are genuinely three different things:
+#
+#   watch      - a change anywhere under here means this service changed
+#   context    - the directory passed to `docker build`
+#   dockerfile - the Dockerfile to build with
+#
+# For nine of the ten services watch == context. cartservice is the exception
+# and is the reason these are separate fields rather than one path plus a
+# convention: its solution file and tests live at src/cartservice, but the
+# Dockerfile and .csproj live at src/cartservice/src. Watching only the build
+# context would miss a change to the tests or the .sln; building from the
+# watch path would fail to find the Dockerfile.
+#
+# Adding a service here is what makes CI build it. A directory under src/
+# that is not listed is reported as an unknown deployable unit rather than
+# being guessed at.
+
+services:
+  - name: frontend
+    watch: src/frontend
+    context: src/frontend
+    dockerfile: src/frontend/Dockerfile
+
+  - name: cartservice
+    # watch != context. See the note above.
+    watch: src/cartservice
+    context: src/cartservice/src
+    dockerfile: src/cartservice/src/Dockerfile
+
+  - name: productcatalogservice
+    watch: src/productcatalogservice
+    context: src/productcatalogservice
+    dockerfile: src/productcatalogservice/Dockerfile
+
+  - name: currencyservice
+    watch: src/currencyservice
+    context: src/currencyservice
+    dockerfile: src/currencyservice/Dockerfile
+
+  - name: paymentservice
+    watch: src/paymentservice
+    context: src/paymentservice
+    dockerfile: src/paymentservice/Dockerfile
+
+  - name: shippingservice
+    watch: src/shippingservice
+    context: src/shippingservice
+    dockerfile: src/shippingservice/Dockerfile
+
+  - name: emailservice
+    watch: src/emailservice
+    context: src/emailservice
+    dockerfile: src/emailservice/Dockerfile
+
+  - name: checkoutservice
+    watch: src/checkoutservice
+    context: src/checkoutservice
+    dockerfile: src/checkoutservice/Dockerfile
+
+  - name: recommendationservice
+    watch: src/recommendationservice
+    context: src/recommendationservice
+    dockerfile: src/recommendationservice/Dockerfile
+
+  - name: adservice
+    watch: src/adservice
+    context: src/adservice
+    dockerfile: src/adservice/Dockerfile
+
+# Paths that affect every service.
+#
+# protos/ holds the single gRPC contract all ten services compile against,
+# and each service commits its generated stubs. A change here is a fan-out:
+# a naive per-directory diff would match no service directory and build
+# nothing, which is the failure this list exists to prevent.
+#
+# This list is deliberately short. Phase 1 found no other shared code, and
+# nothing speculative belongs here - a path listed here rebuilds all ten
+# services on every touch.
+fanout:
+  - protos
+
+# Paths that never trigger an application build.
+#
+# GitOps changes are validated separately; rebuilding images because an
+# overlay changed would invert the promotion model, where CI produces an
+# image and Git promotes it.
+ignore:
+  - gitops
+  - docs
+  - ci
+  - README.md
+  - SERVICES.md
+  - LICENSE
+  - .gitignore
+  - .gitattributes
