@@ -1,0 +1,29 @@
+# Build output
+bin/
+obj/
+build/
+dist/
+target/
+*.exe
+*.dll
+*.pdb
+
+# Dependencies
+node_modules/
+__pycache__/
+*.py[cod]
+.gradle/
+
+# Local env / secrets
+.env
+.env.*
+*.local
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Kustomize render output (Phase 3 produces these; they are not committed)
+rendered/

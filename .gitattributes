@@ -1,0 +1,9 @@
+# Preserve upstream LF endings. Containers run Linux; CRLF breaks
+# shebang scripts (genproto.sh, gradlew) and Dockerfile parsing.
+* text=auto eol=lf
+
+# Binary assets — never touch
+*.png binary
+*.jpg binary
+*.ico binary
+*.jar binary
