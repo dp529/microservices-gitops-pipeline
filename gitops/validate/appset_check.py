@@ -54,17 +54,69 @@ def discover(environment):
     )
 
 
-def substitute(text, params):
-    """Resolve {{var}} and {{path.basename}} the way Argo CD would."""
+def go_template(text, params):
+    """Render a Go template the way the ApplicationSet controller does.
+
+    Only the subset used here is supported: dotted field access, `if/else`,
+    `eq`, and whitespace trimming with {{- -}}. A missing key raises, which
+    mirrors goTemplateOptions: [missingkey=error].
+    """
+    def lookup(expr):
+        cur = params
+        for part in expr.strip().lstrip(".").split("."):
+            if not isinstance(cur, dict) or part not in cur:
+                raise KeyError(expr)
+            cur = cur[part]
+        return cur
+
+    # {{- if eq .x "y" }} A {{- else }} B {{- end }}
+    cond = re.compile(
+        r"\{\{-?\s*if\s+eq\s+(\.[\w.]+)\s+\"([^\"]*)\"\s*-?\}\}"
+        r"(.*?)"
+        r"(?:\{\{-?\s*else\s*-?\}\}(.*?))?"
+        r"\{\{-?\s*end\s*-?\}\}",
+        re.S,
+    )
+
+    def resolve_cond(m):
+        var, want, then, other = m.group(1), m.group(2), m.group(3), m.group(4) or ""
+        return then if str(lookup(var)) == want else other
+
+    prev = None
+    out = text
+    while prev != out:
+        prev = out
+        out = cond.sub(resolve_cond, out)
+
+    # {{ .a.b }}
+    out = re.sub(r"\{\{-?\s*(\.[\w.]+)\s*-?\}\}",
+                 lambda m: str(lookup(m.group(1))), out)
+    return out
+
+
+def fasttemplate(text, params):
+    """Legacy non-Go substitution, for comparison only."""
     out = text
     for k, v in params.items():
         out = out.replace("{{%s}}" % k, str(v))
     return out
 
 
+def merge(base, patch):
+    """Strategic-ish merge of the templatePatch result over the Application."""
+    for k, v in patch.items():
+        if isinstance(v, dict) and isinstance(base.get(k), dict):
+            merge(base[k], v)
+        else:
+            base[k] = v
+    return base
+
+
 def expand(appset):
     """Run the matrix generator and return the generated Applications."""
-    gens = appset["spec"]["generators"]
+    spec = appset["spec"]
+    go = spec.get("goTemplate", False)
+    gens = spec["generators"]
     if len(gens) != 1 or "matrix" not in gens[0]:
         fail("generator", "expected exactly one matrix generator")
         return []
@@ -83,28 +135,142 @@ def expand(appset):
 
     envs = lists[0]["list"]["elements"]
     git_paths = gits[0]["git"]["directories"]
-    template = appset["spec"]["template"]
-    raw = yaml.dump(template, default_flow_style=False)
+    raw = yaml.dump(spec["template"], default_flow_style=False)
+    patch_tpl = spec.get("templatePatch")
+    render = go_template if go else fasttemplate
+    env_ref = "{{.environment}}" if go else "{{environment}}"
 
     apps = []
     for env in envs:
-        # Confirm the git generator path is parameterised by environment,
+        # The git generator path must be parameterised by environment,
         # not hardcoded to one of them.
         for entry in git_paths:
-            path_pattern = entry["path"]
-            if "{{environment}}" not in path_pattern:
+            if env_ref not in entry["path"]:
                 fail("generator",
-                     "git directory path %r is not parameterised by "
-                     "{{environment}}" % path_pattern)
+                     "git directory path %r is not parameterised by %s"
+                     % (entry["path"], env_ref))
             ok()
 
         for service in discover(env["environment"]):
             params = dict(env)
-            params["path"] = "gitops/overlays/%s/%s" % (env["environment"], service)
-            params["path.basename"] = service
-            rendered = yaml.safe_load(substitute(raw, params))
+            dirpath = "gitops/overlays/%s/%s" % (env["environment"], service)
+            if go:
+                # Under Go templating the git generator exposes `path` as an
+                # object, not a bare string.
+                params["path"] = {
+                    "path": dirpath,
+                    "basename": service,
+                    "basenameNormalized": service,
+                    "segments": dirpath.split("/"),
+                }
+            else:
+                params["path"] = dirpath
+                params["path.basename"] = service
+
+            try:
+                rendered = yaml.safe_load(render(raw, params))
+            except KeyError as e:
+                fail("template",
+                     "%s/%s: template references %s which no generator "
+                     "supplies (missingkey=error)" % (env["environment"], service, e))
+                continue
+
+            if patch_tpl:
+                try:
+                    patch = yaml.safe_load(render(patch_tpl, params))
+                except KeyError as e:
+                    fail("templatePatch",
+                         "%s/%s: templatePatch references %s which no "
+                         "generator supplies" % (env["environment"], service, e))
+                    patch = None
+                if patch:
+                    merge(rendered, patch)
+
             apps.append((env["environment"], service, rendered))
     return apps
+
+
+# Fields the Application CRD types as booleans. Templating a string into any
+# of these is invalid, and "false" is additionally truthy to anything doing a
+# non-empty check - the inverse of the intent.
+BOOLEAN_FIELDS = [
+    ("spec", "syncPolicy", "automated", "prune"),
+    ("spec", "syncPolicy", "automated", "selfHeal"),
+    ("spec", "syncPolicy", "automated", "allowEmpty"),
+]
+
+
+def dig(d, path):
+    cur = d
+    for k in path:
+        if not isinstance(cur, dict) or k not in cur:
+            return None
+        cur = cur[k]
+    return cur
+
+
+def check_boolean_fields(appset):
+    """Reject boolean fields carrying a templated or quoted string.
+
+    This is the defect this phase exists to catch: Go templating substitutes
+    into strings, so prune: "{{.prune}}" renders the *string* "false" into a
+    field the CRD types as bool.
+    """
+    tpl = appset["spec"].get("template", {})
+    for path in BOOLEAN_FIELDS:
+        v = dig({"spec": tpl.get("spec", {})}, path)
+        if v is None:
+            ok()
+            continue
+        if isinstance(v, str):
+            if "{{" in v:
+                fail("boolean-template",
+                     "%s is templated (%r). Go templating only substitutes "
+                     "into strings; this renders a string into a boolean "
+                     "field. Use templatePatch instead."
+                     % (".".join(path), v))
+            else:
+                fail("boolean-template",
+                     "%s is the string %r, not a boolean" % (".".join(path), v))
+        elif not isinstance(v, bool):
+            fail("boolean-template",
+                 "%s is %r (%s), expected a boolean"
+                 % (".".join(path), v, type(v).__name__))
+        ok()
+
+
+def check_template_syntax(appset, text):
+    """When goTemplate is on, every expression must use the Go form."""
+    go = appset["spec"].get("goTemplate", False)
+    exprs = re.findall(r"\{\{[^}]*\}\}", text)
+    for e in exprs:
+        # Strip the braces, then the whitespace-trim markers, then any
+        # whitespace they were hiding. Order matters: "{{- if x }}" leaves a
+        # leading space if the dashes are removed before the second strip.
+        body = e.strip("{}").strip()
+        body = body.lstrip("-").rstrip("-").strip()
+        if not body:
+            continue
+        # Control structures and functions are Go-only and always valid here.
+        if re.match(r"^(if|else|end|range|with|define|template|block)", body):
+            ok()
+            continue
+        if go:
+            if not body.startswith("."):
+                fail("legacy-syntax",
+                     "%s uses legacy fasttemplate syntax; with goTemplate: "
+                     "true every parameter needs a leading dot (e.g. "
+                     "{{.environment}})" % e)
+            if body in (".path", "{{.path}}"):
+                fail("legacy-syntax",
+                     "%s renders the path object, not a string; use "
+                     "{{.path.path}} for the directory" % e)
+        else:
+            if body.startswith("."):
+                fail("legacy-syntax",
+                     "%s uses Go-template syntax but goTemplate is not "
+                     "enabled" % e)
+        ok()
 
 
 def check_no_hardcoded_services(text):
@@ -132,7 +298,16 @@ def main():
         fail("kind", "project.yaml is not an AppProject")
     ok(2)
 
+    go = appset["spec"].get("goTemplate", False)
+    print("  goTemplate:        %s" % go)
+    print("  goTemplateOptions: %s"
+          % (appset["spec"].get("goTemplateOptions") or "none"))
+    print("  templatePatch:     %s\n"
+          % ("present" if appset["spec"].get("templatePatch") else "absent"))
+
     check_no_hardcoded_services(appset_text)
+    check_template_syntax(appset, appset_text)
+    check_boolean_fields(appset)
 
     # ---- expand the matrix -----------------------------------------
     apps = expand(appset)
@@ -186,6 +361,15 @@ def main():
             fail("template", "%s has unresolved variables: %s"
                  % (name, sorted(set(leftover))))
         ok()
+
+        # rendered booleans must be real booleans, not strings
+        for bpath in BOOLEAN_FIELDS:
+            v = dig(app, bpath)
+            if v is not None and not isinstance(v, bool):
+                fail("boolean-render",
+                     "%s rendered %s as %r (%s), not a boolean"
+                     % (name, ".".join(bpath), v, type(v).__name__))
+            ok()
 
         # source path must be a real directory containing a kustomization.
         # Paths are repo-relative ("gitops/overlays/..."), so resolve them

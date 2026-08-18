@@ -4,6 +4,18 @@ metadata:
   name: boutique
   namespace: argocd
 spec:
+  # Go templating. Every expression below therefore uses the Go form with a
+  # leading dot ({{.environment}}) rather than the legacy fasttemplate form
+  # (the same name with no dot). Under Go templating the git generator
+  # exposes `path` as an object, so the directory is {{.path.path}} and its
+  # last element is {{.path.basename}}.
+  goTemplate: true
+
+  # Surface a missing key as an error at render time instead of silently
+  # substituting "<no value>" into a field.
+  goTemplateOptions:
+    - missingkey=error
+
   # Keep generated Applications when this ApplicationSet is deleted, rather
   # than cascading a delete across every environment at once.
   syncPolicy:
@@ -18,13 +30,15 @@ spec:
   #     per-environment settings, and a fourth should never appear by
   #     accident because someone added a directory.
   #
-  #   - Services are DISCOVERED from the repository by a git directory
-  #     generator. Service names are never written down here. Adding
+  #   - Services are DISCOVERED by a git directory generator. Service
+  #     names are never written down here. Adding
   #     gitops/overlays/*/newservice/ creates its Applications; deleting
   #     the directories removes them.
   #
   # The matrix takes the cross product: 3 environments x 10 discovered
-  # services = 30 Applications.
+  # services = 30 Applications. Parameters from the first child generator
+  # are available to the second, which is how the git generator scans the
+  # directory of the environment currently being expanded.
   # =====================================================================
   generators:
     - matrix:
@@ -32,10 +46,10 @@ spec:
           # ---------------------------------------------------------------
           # Generator 1 - environments, explicit.
           #
-          # Every environment-specific value lives here. Today the three
-          # entries differ only in namespace and revision; the fields are
-          # already separated so that when real clusters exist, only this
-          # block changes.
+          # Every environment-specific value lives here. `prune` is a
+          # string on purpose: generator parameters are strings, and it is
+          # consumed by the templatePatch below rather than being written
+          # straight into a boolean field. See the note on templatePatch.
           # ---------------------------------------------------------------
           - list:
               elements:
@@ -47,21 +61,18 @@ spec:
                   # Dev tracks the mainline. A merge to main reaches dev
                   # without a promotion PR.
                   revision: main
-                  selfHeal: "true"
                   prune: "true"
 
                 - environment: staging
                   namespace: boutique-staging
                   destinationServer: https://kubernetes.default.svc
                   revision: main
-                  selfHeal: "true"
                   prune: "true"
 
                 - environment: prod
                   namespace: boutique-prod
                   destinationServer: https://kubernetes.default.svc
                   revision: main
-                  selfHeal: "true"
                   # Prod does not prune. A resource disappearing from the
                   # rendered output is reported as OutOfSync rather than
                   # deleted, so an accidental removal in Git does not
@@ -71,8 +82,8 @@ spec:
           # ---------------------------------------------------------------
           # Generator 2 - services, discovered from the repository.
           #
-          # `{{environment}}` is substituted from the list generator above,
-          # so this scans the directories that actually exist inside the
+          # {{.environment}} comes from the list generator above, so this
+          # scans the directories that actually exist inside the
           # environment being generated. No service name appears anywhere
           # in this file.
           # ---------------------------------------------------------------
@@ -81,21 +92,25 @@ spec:
               repoURL: https://github.com/REPLACE-ME/boutique-gitops.git
               revision: main
               directories:
-                - path: gitops/overlays/{{environment}}/*
-              # `path.basename` from this generator is the service name.
+                - path: gitops/overlays/{{.environment}}/*
 
   # =====================================================================
   # TEMPLATE - one Application per (environment, service) pair.
+  #
+  # Only string fields are templated here. Booleans that differ per
+  # environment are set by the templatePatch below, because Go templating
+  # substitutes into strings: writing prune: "{{.prune}}" would place the
+  # string "false" where the CRD requires a boolean.
   # =====================================================================
   template:
     metadata:
       # <service>-<environment>, where <service> is the discovered
       # directory name. No service is named anywhere in this file.
-      name: "{{path.basename}}-{{environment}}"
+      name: "{{.path.basename}}-{{.environment}}"
       labels:
-        app.kubernetes.io/name: "{{path.basename}}"
+        app.kubernetes.io/name: "{{.path.basename}}"
         app.kubernetes.io/part-of: boutique
-        boutique.env: "{{environment}}"
+        boutique.env: "{{.environment}}"
       finalizers:
         - resources-finalizer.argocd.argoproj.io
     spec:
@@ -104,18 +119,17 @@ spec:
       source:
         # PLACEHOLDER - must match sourceRepos in project.yaml.
         repoURL: https://github.com/REPLACE-ME/boutique-gitops.git
-        targetRevision: "{{revision}}"
-        # `path` is the discovered directory itself, so this resolves to
-        # gitops/overlays/<environment>/<service> without reassembling it
-        # from parts.
-        path: "{{path}}"
+        targetRevision: "{{.revision}}"
+        # Under Go templating the git generator's `path` is an object;
+        # `.path.path` is the directory relative to the repository root.
+        path: "{{.path.path}}"
 
       destination:
-        server: "{{destinationServer}}"
+        server: "{{.destinationServer}}"
         # The overlay already sets this namespace. Declaring it here too
         # means a mismatch between the two is caught by the AppProject
         # destination allow-list instead of deploying somewhere unintended.
-        namespace: "{{namespace}}"
+        namespace: "{{.namespace}}"
 
       # -----------------------------------------------------------------
       # Sync policy.
@@ -124,23 +138,20 @@ spec:
       # change itself: a digest reaches staging or prod only through a
       # promotion PR. Requiring a manual Argo sync on top of an approved,
       # merged PR would be a second approval for a decision already made,
-      # and would leave the cluster knowingly diverged from Git in the
-      # meantime.
+      # and would leave the cluster knowingly diverged from Git meanwhile.
       #
-      # Prod differs from dev in what it will do on its own - it self-heals
-      # but never prunes - not in whether a human pressed a button.
+      # selfHeal is true everywhere and is written literally, since it does
+      # not vary. prune varies per environment and is applied by
+      # templatePatch.
       # -----------------------------------------------------------------
       syncPolicy:
         automated:
-          prune: "{{prune}}"
-          selfHeal: "{{selfHeal}}"
+          selfHeal: true
           # Do not sync while the target revision is missing or the repo is
           # unreachable; leave the last good state running.
           allowEmpty: false
         syncOptions:
           - CreateNamespace=true
-          # Argo CD applies the namespace from destination.namespace rather
-          # than trusting whatever the manifest carries.
           - RespectIgnoreDifferences=true
           - ApplyOutOfSyncOnly=true
         retry:
@@ -162,3 +173,31 @@ spec:
           kind: Deployment
           jsonPointers:
             - /spec/replicas
+
+  # =====================================================================
+  # templatePatch - environment-specific BOOLEAN fields.
+  #
+  # Go templating operates on strings, so a boolean field cannot be
+  # templated in the `template` block above: prune: "{{.prune}}" yields the
+  # string "false", which is not a boolean and, being non-empty, reads as
+  # true to anything doing a truthiness check - the exact inverse of what
+  # prod wants.
+  #
+  # templatePatch is evaluated as a Go template producing YAML, which is
+  # then merged over the rendered Application. Because the template output
+  # is parsed as YAML *after* substitution, `prune: true` here is a real
+  # boolean, not a quoted string.
+  #
+  # The conditional is written on the environment name rather than on the
+  # parameter string so the intent is legible: prod does not prune.
+  # =====================================================================
+  templatePatch: |
+    spec:
+      syncPolicy:
+        automated:
+          selfHeal: true
+          {{- if eq .environment "prod" }}
+          prune: false
+          {{- else }}
+          prune: true
+          {{- end }}

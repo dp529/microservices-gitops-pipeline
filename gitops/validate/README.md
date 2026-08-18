@@ -88,3 +88,23 @@ caught. Two bugs in the validator itself were found and fixed this way: source
 paths were resolved against the wrong root, and the sample-report code crashed
 on a missing `automated` block before the findings could print. Both would have
 made the tool report success on broken input.
+
+## Go templating
+
+The ApplicationSet sets `goTemplate: true`, so the validator renders a real Go
+template rather than doing string replacement, and enforces three rules that a
+plain YAML parse cannot see:
+
+- **Templated boolean fields are rejected.** `prune` and `selfHeal` are typed
+  `bool` by the Application CRD. Go templating substitutes into *strings*, so
+  `prune: "{{.prune}}"` renders the string `"false"` into a boolean field -
+  and `"false"` is a non-empty string, so anything doing a truthiness check
+  reads it as true, the inverse of the intent. Per-environment booleans are
+  applied with `templatePatch`, whose output is parsed as YAML after
+  substitution and therefore yields real booleans.
+- **Legacy fasttemplate syntax is rejected when `goTemplate: true`.** Every
+  parameter needs a leading dot, and the git generator's `path` is an object,
+  so the directory is `{{.path.path}}`, not `{{.path}}`.
+- **Unresolved parameters are rejected.** The renderer raises on a missing key,
+  matching `goTemplateOptions: [missingkey=error]`, so a typo fails at
+  validation instead of rendering `<no value>` into a live Application.
