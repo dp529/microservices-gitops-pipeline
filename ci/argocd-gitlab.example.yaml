@@ -1,0 +1,14 @@
+# REQUIRED: replace these with the agreed GitLab project and registered Argo
+# destination(s). This file is input to the renderer, never an apply manifest.
+repoURL: REPLACE_WITH_GITLAB_PROJECT_HTTPS_GIT_URL
+targetRevision: main
+destinations:
+  dev:
+    server: REPLACE_WITH_REGISTERED_DEV_CLUSTER_API_URL
+    namespace: boutique-dev
+  staging:
+    server: REPLACE_WITH_REGISTERED_STAGING_CLUSTER_API_URL
+    namespace: boutique-staging
+  prod:
+    server: REPLACE_WITH_REGISTERED_PROD_CLUSTER_API_URL
+    namespace: boutique-prod

@@ -1,0 +1,87 @@
+# Argo CD deploys the GitOps overlays. CI never applies workloads to a cluster.
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_PIPELINE_SOURCE == "web" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - when: never
+
+stages: [validate, detect, delivery, promotion]
+variables:
+  GIT_DEPTH: "0"
+  CI_MODE: build
+  FORCE_BUILD_ALL: "false"
+  PROMOTE_SOURCE: dev
+  PROMOTE_TARGET: staging
+  PROMOTE_SERVICES: all
+  KUBECTL_VERSION: v1.35.0
+  TRIVY_VERSION: "0.69.3"
+  # Preserve the repository Argo CD already watches. A GitLab job token does
+  # not authenticate GitHub; set masked/protected GITHUB_GITOPS_TOKEN there.
+  GITOPS_BACKEND: github
+  GITOPS_REPO_URL: https://github.com/dp529/microservices-gitops-pipeline.git
+  GITOPS_BRANCH: main
+
+.python-job:
+  image: python:3.12-bookworm
+  before_script:
+    - bash ci/gitlab_setup.sh
+    - export PATH="/tmp/boutique-ci-venv/bin:$PATH"
+
+validate:
+  extends: .python-job
+  stage: validate
+  script:
+    - python ci/test_affected.py
+    - python ci/test_promotion.py
+    - python ci/test_pipeline.py
+    - python gitops/validate/semantic_check.py
+    - python gitops/validate/appset_check.py
+    - python ci/test_gitlab.py
+
+detect:
+  extends: .python-job
+  stage: detect
+  rules:
+    - if: '$CI_MODE == "build"'
+  script:
+    - python ci/gitlab_generate.py
+  artifacts:
+    paths: [generated-gitlab-ci.yml, affected-services.json]
+    expire_in: 1 day
+
+delivery:
+  stage: delivery
+  rules:
+    - if: '$CI_MODE == "build"'
+  trigger:
+    include:
+      - artifact: generated-gitlab-ci.yml
+        job: detect
+    strategy: mirror
+    forward:
+      pipeline_variables: true
+
+promote-staging:
+  extends: .python-job
+  stage: promotion
+  resource_group: boutique-gitops-main
+  environment: staging
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "web" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_MODE == "promote" && $PROMOTE_SOURCE == "dev" && $PROMOTE_TARGET == "staging"'
+      when: manual
+  allow_failure: false
+  script:
+    - python ci/gitlab_release.py promote
+
+promote-prod:
+  extends: .python-job
+  stage: promotion
+  resource_group: boutique-gitops-main
+  environment: prod-promotion
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "web" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_MODE == "promote" && $PROMOTE_SOURCE == "staging" && $PROMOTE_TARGET == "prod"'
+      when: manual
+  allow_failure: false
+  script:
+    - python ci/gitlab_release.py promote
